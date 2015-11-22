@@ -1,0 +1,226 @@
+---
+title: "PML Course Project"
+author: "Daniel Alaiev"
+date: "November 20, 2015"
+output: html_document
+---
+###Introduction
+
+The data set used in this analysis is the [Weight Lifting Exercises Dataset](http://groupware.les.inf.puc-rio.br/har#weight_lifting_exercises). The goal is to predict the *classe* variable using the others. There are five levels of *classe*: A, B, C, D, and E. They correspond to five different classification levels for one set of 10 repetitions of the *Unilateral Dumbbell Biceps Curl*. The exercises were performed by six male participants aged between 20-28 years, with little weight lifting experience. The dumbbell weighed 1.25kg.
+
+* **A** = exactly according to the specification
+* **B** = throwing the elbows to the front
+* **C** = lifting the dumbbell only halfway
+* **D** = lowering the dumbbell only halfway
+* **E** = throwing the hips to the front
+
+This report will cover various prediction models, cross validation, the expected out of sample error rate, and why various choices were made. Although prediction accuracy is important, this report will focus more on interpretability. The models will be described only briefly here. The descriptions will gloss over many technical details to reduce the complexity of this analysis and make it more interpretable. There are various resources that offer more complete descriptions of the models and this is **not** what this analysis aims to do.
+
+###Setting The Stage
+
+```{r, message=F, warning=F}
+##Reading in the data.
+
+download.file(url="https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+              ,destfile = "./training.csv")
+
+download.file(url="https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+              ,destfile = "./testing.csv")
+
+training.full<-read.csv("./training.csv")
+
+testing<-read.csv("./testing.csv")
+
+library(caret)
+
+##Setting the seed for reproducibility.
+set.seed(125)
+
+##Splitting the training set into two sets.
+inTrain.1<-createDataPartition(y=training.full$classe,p=0.80,list=FALSE)
+
+training.1<-training.full[inTrain.1,]
+training.2<-training.full[-inTrain.1,]
+```
+
+Since the ultimate goal is to predict on the testing set, we must make sure we are using the same variables from the training sets to build the models. It turns out that there are several variables that are completely NA in the testing set but not in the training sets. The simplest action would be to remove those variables from both the testing and training sets. It should be noted that this is the simplest option and that there are volumes of literature that deal with adjusting for NA values.
+
+```{r, message=F, warning=F}
+testing<-testing[ , colSums(is.na(testing)) == 0]
+testing<-testing[,-60]
+
+##Going back to the training sets and making sure they contain those 59 vars.
+variables<-c("classe",colnames(testing))
+
+idx<-match(variables,names(training.1))
+training.1<-training.1[,idx]
+training.2<-training.2[,idx]
+```
+
+Finally, a function needs to be created to quickly test the overall accuracy of the various models. The classic definition of *accuracy* will be used here. That is: [(TP+TN)/(TP+FP+FN+TN)](https://en.wikipedia.org/wiki/Accuracy_and_precision), while taking into account the multiple categories of *classe*. The function tests the accuracy on the *second* training set, which was not used to train the original model.
+
+```{r, message=F, warning=F}
+accuracy<-function(model)
+{
+    predictions<-predict(model,training.2)
+    
+    return(confusionMatrix(predictions,training.2$classe)$overall[1])
+}
+```
+
+###The Train Function
+
+The *train* function from the *caret* package will be used to build each model. Many models have unique model specific parameters that need to be explicitly specified. There are hundreds of different models and probably several thousand parameters that can be tweaked. The *train* function deals with this tweaking using resampling methods. It chooses the "optimal" model parameters and the corresponding "optimal" model. This brief description glosses over many features of *train* and a more complete description is available [here](http://topepo.github.io/caret/training.html).
+
+###Quadratic Discriminant Analysis
+
+The first model used is known as **Quadratic Discriminant Analysis** or **QDA**. It builds on **Linear Discriminant Analysis** or **LDA**. This uses Bayes' Theorem for classification. A LDA model is constructed using:
+
+* An overall *prior probability* that a randomly chosen observation comes from a certain class
+
+* The density function of a particular predictor that comes from a particular class
+
+* A *posterior probability estimate* for an observation constructed with the information mentioned above
+
+Usually the density function of a feature from a particular category is assumed to be Gaussian. In practice, all of the parameters mentioned above have to be estimated. The resulting *discriminant functions* create linear decision lines. When there are multiple predictors, multivariate Gaussian distributions are used. 
+
+Quadratic Discriminant Analysis expands on this by assuming that each class has its own covariance matrix. Roughly speaking, this means that the relationships among the variables change with different levels of the classifier. By accounting for this change, QDA sometimes provides a better prediction. However, QDA requires the covariance matrices to be estimated which means we need a very large sample size. Our data contain many different predictors and it might be fair to assume their relationships change with different levels of *classe*.
+
+```{r, message=F, warning=F}
+model.lda<-train(classe~.,method="lda",data=training.1[,-(2:8)],verbose=FALSE)
+
+model.qda<-train(classe~.,method="qda",data=training.1[,-(2:8)],verbose=FALSE)
+
+lda.accuracy<-round(accuracy(model.lda),4)
+
+qda.accuracy<-round(accuracy(model.qda),4)
+```
+
+The LDA model has an accuracy of `r lda.accuracy` and the QDA model has an accuracy of `r qda.accuracy`. We can see that allowing for class specific covariance matrices has improved the accuracy by a large margin. The QDA accuracy is still a bit low and this is probably due to the multivariate Gaussian assumption. There are probably ways to adjust for this assumption but this introduces an extra level of complexity to the model.
+
+###Gradient Boosting
+
+**Boosting** involves combining multiple weak models in a systematic fashion to create a stronger overall model. The algorithm first starts with a set of classifiers, such as all possible trees. It then looks to combine all of the classification functions to minimize some error measure on the training set. A classifier is selected at each step and weights are calculated based on the errors. These are used to upweight the missed classifications and the next classifier is selected. After many rounds, a final hypothesis is created with a weighted combined version of the original classification functions. 
+
+*Stochastic Gradient Boosting* is an improvement on the basic boosting method. At each iteration of the algorithm, a classifier is fit on a *subsample* of the training set rather than the entire set. This has been shown to prevent overfitting. One way to think about this is to describe it as an additive weighted expansion of classification trees that takes into account the problem of overfitting. This method introduces a few parameters that need to be optimized: Number of Boosting Iterations, Max Tree Depth, Shrinkage, and Minimum Terminal Node Size. The *train* function takes care of this.
+
+```{r, message=F, warning=F}
+model.gbm<-train(classe~.,method="gbm",data=training.1[,-(2:8)],verbose=FALSE)
+
+gbm.accuracy<-round(accuracy(model.gbm),4)
+```
+
+This model is quite accurate with an overall accuracy of `r gbm.accuracy`. By combining many trees while focusing on errors and keeping overfitting in mind, Stochastic Gradient Boosting has created a good model.
+
+###Random Forests
+
+The **Random Forest** methodology builds on classical decision trees and tweaks the model for higher accuracy. **Classification Trees** iteratively split variables into groups, evaluation the *homogeneity* within each group, and split again if necessary. During prediction, we assign a new observation in a specific region to the most commonly occurring class of training observations in that region. This process usually overfits the data, which leads to weak results on the testing set. A process called *tree pruning* grows a very large tree and then cuts it down using some methodology. The methodology usually requires a tuning parameter to be selected. *Cost complexity pruning* is one such method and it is similar to the *lasso* approach to regularizing linear models.  
+
+The Random Forest takes things two steps further. The algorithm boostraps samples, bootstraps variables *at each split*, grows *multiple* trees, and finally takes a majority vote. Bootstrapping here simply means sampling with replacement. Random Forests provide an advantage over *bagging*, or bootsrapping and aggregating, by *decorrelating* the trees. Bagging is the step between the classic tree and the random forest model. It resamples cases, recalculates predictions, and majority votes. It *does not* resample the variables at each split. 
+
+Three models are compared below: cost complexity pruning, bagging, and the random forest.
+
+```{r, message=F, warning=F}
+model.rpart<-train(classe~.,method="rpart",data=training.1[,-(2:8)])
+
+model.rf<-train(classe~.,method="rf",data=training.1[,-(2:8)],verbose=FALSE)
+
+model.treebag<-train(classe~.,method="treebag",data=training.1[,-(2:8)])
+
+rpart.accuracy<-round(accuracy(model.rpart),4)
+
+rf.accuracy<-round(accuracy(model.rf),4)
+
+treebag.accuracy<-round(accuracy(model.treebag),4)
+```
+
+Even when bootsrapped with *train*, which gives an optimized complexity parameter, the standard tree model has an accuracy of only `r rpart.accuracy`. We can clearly see that the classic approach with a complexity parameter is insufficient. Bagging offers a massive improvement over this with an accuracy of `r treebag.accuracy`. This produces a nearly perfect classification algorithm. Finally, the random forest model improves on this a little with an accuracy of `r rf.accuracy`. Decorrelating the trees has given us a small improvement in this case.
+
+###Model Comparison and Final Choice
+
+First, let's take a look at the overall accuracies of the models on the second training set. The second training set was *not* used while creating the models.
+
+```{r, message=F, warning=F}
+all.accuracies<-c(lda.accuracy,qda.accuracy,gbm.accuracy,rpart.accuracy,
+                   treebag.accuracy,rf.accuracy)
+
+names(all.accuracies)<-c("LDA","QDA","GBM","RPART","TREEBAG","RF")
+
+all.accuracies
+```
+
+We can see that the Stochastic Gradient Boosting, Tree Bagging, and Random Forest models perform best. LDA's and QDA's Gaussian assumptions likely don't hold, which explains their accuracy being lower than the other methods. QDA did better than LDA probably due to the flexibility of the decision boundaries. Recursive partitioning performed very poorly, even when a complexity cost was introduced. This performance could likely be improved by tweaking the *rpart.control* function, which is beyond the scope of this analysis.
+
+###Estimating Out of Sample Error
+
+The point of the exercise is to create a good prediction model that will be tested on a final data set with 20 observations. A good way to estimate the *out of sample error* would be to sample 20 observations many times from the second training set and see what the distribution of errors is like for different models. 
+
+```{r, message=F, warning=F}
+##Accuracy distribution function.
+accuracy.dist<-function(model)
+{
+    accuracy.dist<-vector()
+    
+    for(i in 1:1000){
+    ##Sampling from the second training set with replacement.
+    training.2.sample<-training.2[sample(nrow(training.2),20,replace=T),]
+    
+    predictions<-predict(model,training.2.sample)
+    
+    accuracy.dist<-c(accuracy.dist,
+          confusionMatrix(predictions,training.2.sample$classe)$overall[1])
+    }
+    
+    return(accuracy.dist)
+}
+
+accuracy.dist.lda<-accuracy.dist(model.lda)
+accuracy.dist.qda<-accuracy.dist(model.qda)
+accuracy.dist.gbm<-accuracy.dist(model.gbm)
+accuracy.dist.rf<-accuracy.dist(model.rf)
+accuracy.dist.rpart<-accuracy.dist(model.rpart)
+accuracy.dist.treebag<-accuracy.dist(model.treebag)
+
+accuracy.dists.all<-cbind(accuracy.dist.lda,accuracy.dist.qda,
+                          accuracy.dist.gbm,
+                          accuracy.dist.rpart,accuracy.dist.treebag,
+                          accuracy.dist.rf)
+
+colnames(accuracy.dists.all)<-c("LDA","QDA","GBM","RPART","TREEBAG","RF")
+```
+
+Now that we have the error rates for the different models in one place, we can plot their densities to see what they look like. 
+
+```{r, message=F, warning=F}
+library(reshape2)
+
+accuracy.dists.all.melted<-melt(accuracy.dists.all)
+
+colnames(accuracy.dists.all.melted)[2]<-c("Model")
+
+library(ggplot2)
+
+ggplot(accuracy.dists.all.melted,aes(x=Model,y=value)) +
+                    geom_violin(scale = "width",aes(fill=Model)) +
+                    xlab("Model Type") +
+                    ylab("Accuracy") +
+                    ggtitle("Out of Sample Error Estimation")
+```
+
+This *violin plot* shows that the distributions of the error rates tend to get tighter as the models get more accurate. It means that more accurate models are consistently more accurate, even for small testing sets. We can also take a look at the means and standard deviations of the accuracy distributions to confirm this and make our final model choice.
+
+```{r, message=F, warning=F}
+Accuracy.Mean<-tapply(accuracy.dists.all.melted$value,
+                INDEX=list(accuracy.dists.all.melted$Model),mean)
+
+Accuracy.SD<-tapply(accuracy.dists.all.melted$value,
+              INDEX=list(accuracy.dists.all.melted$Model),sd)
+
+Accuracy.Summary<-round(rbind(Accuracy.Mean,Accuracy.SD),4)
+
+library(knitr)
+
+kable(Accuracy.Summary)
+```
+
+Finally, we can see that the Random Forest model has the highest average accuracy and the lowest accuracy standard deviation. It is the final choice for the testing set. We used cross validation to train our model on one set and repeatedly test it on another one. This substantiates the claim that this is a "good" model and shows that it is also robust.
